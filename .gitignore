@@ -1,0 +1,21 @@
+# Secrets — never commit
+.polymarket_credentials
+.telegram_credentials
+.killswitch
+.env
+*.key
+*.pem
+# Python
+venv/
+__pycache__/
+*.pyc
+# Runtime state & data (regenerated when the bot runs)
+*_portfolio.json
+*_trades.json
+*_stats.json
+trend_history.json
+patch_history.json
+# Logs
+*.log
+# Supervisor backups
+*.backup_*
