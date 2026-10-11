@@ -56,7 +56,12 @@ def render_dashboard(base_dir: str, prefix: str = "crypto") -> str:
 
     now = datetime.now().strftime("%H:%M:%S")
     label = prefix.upper()
-    mode_txt = "LIVE 💸 REAL MONEY" if prefix == "live" else "PAPER MODE"
+    if prefix == "live":
+        mode_txt = "LIVE 💸 REAL MONEY"
+    elif prefix in ("market", "limit", "crypto"):
+        mode_txt = "PAPER MODE"
+    else:
+        mode_txt = "SIM (real order book, no money)"
 
     if not portfolio:
         return (

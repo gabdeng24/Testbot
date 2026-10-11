@@ -104,6 +104,29 @@ LIVE_BANKROLL = 20.0
 LIVE_BET_USD  = 1.0
 EXECUTOR      = None      # set in run_bot() when LIVE_MODE
 
+# ── SIM MODE (realistic paper) ────────────────────────────────────────────────
+# Activated by --sim. Places NO real orders. Instead of assuming a fill at the
+# decision price (what plain --paper does), it reads Polymarket's PUBLIC order
+# book at the exact moment the live executor would, and applies the same rules
+# the live executor applies. This is what made live results differ from paper.
+#
+#   SIM_PRICE_SOURCE  "gamma": decide on the gamma snapshot price (= live
+#                     behaviour, reproduces the live results)
+#                     "clob":  re-check the bet's filters against the REAL ask
+#                     before buying (a candidate fix)
+#   SIM_SLIP_UP       block if real ask is this far ABOVE decided price (live: 0.02)
+#   SIM_SLIP_DOWN     block if real ask is this far BELOW decided price
+#                     (live: no limit → None). Setting it makes the cap symmetric.
+#   SIM_FLOOR         block if real ask is below this (live day 1-2: none → 0.0)
+SIM_MODE         = False
+SIM_TAG          = "sim"
+SIM_PRICE_SOURCE = "gamma"
+SIM_SLIP_UP      = 0.02
+SIM_SLIP_DOWN    = None
+SIM_FLOOR        = 0.0
+ATTEMPTS_FILE    = "sim_attempts.json"
+CLOB_URL         = "https://clob.polymarket.com"
+
 TELEGRAM_CREDS_PATH = os.path.expanduser("~/.telegram_credentials")
 _tg = {"loaded": False, "token": None, "chat_id": None}
 
@@ -807,8 +830,8 @@ def match_and_decide(signal: dict, market_5m: dict, market_15m: Optional[dict] =
     if crowd_15m_agrees:
         bet_size = min(MAX_BET_USD, bet_size * 1.2)
     bet_size = round(bet_size, 2)
-    if LIVE_MODE:
-        bet_size = LIVE_BET_USD  # Phase-3 live validation: flat $1 bets
+    if LIVE_MODE or SIM_MODE:
+        bet_size = LIVE_BET_USD  # flat $1 bets (sim mirrors live sizing)
 
     # CLOB token ids for live execution. Gamma's clobTokenIds is a JSON string
     # of [YES_token, NO_token] (same order as outcomePrices). The executor
@@ -1074,6 +1097,156 @@ def live_bet(decision: dict):
     return True
 
 
+# =============================================================================
+# SIM MODE — realistic paper fills from the real (public) order book
+# =============================================================================
+
+def fetch_asks(token_id: str) -> list:
+    """Return the real ask side of the order book, cheapest first: [(price, size)]."""
+    r = requests.get(f"{CLOB_URL}/book", params={"token_id": token_id}, timeout=10)
+    r.raise_for_status()
+    asks = r.json().get("asks", []) or []
+    out = [(float(a["price"]), float(a["size"])) for a in asks
+           if float(a.get("size", 0)) > 0]
+    return sorted(out, key=lambda x: x[0])
+
+
+def walk_book(asks: list, usd: float):
+    """
+    Fill-or-kill market BUY of `usd` against real asks.
+    Returns (avg_price, shares) or (None, 0) if the book is too thin.
+    """
+    remaining, shares = usd, 0.0
+    for price, size in asks:
+        level_cost = price * size
+        take = min(remaining, level_cost)
+        shares += take / price
+        remaining -= take
+        if remaining <= 1e-9:
+            return usd / shares, shares
+    return None, 0.0
+
+
+def _log_attempt(decision: dict, best_ask, status: str, reason: str = ""):
+    """Append every approved decision (filled or blocked) for later analysis."""
+    rec = {
+        "ts":            datetime.now().isoformat(),
+        "market_id":     decision.get("market_id"),
+        "coin":          decision.get("coin"),
+        "bet_side":      decision.get("bet_side"),
+        "decided_price": decision.get("bet_price"),
+        "best_ask":      best_ask,
+        "gap":           (round(best_ask - decision["bet_price"], 4)
+                          if best_ask is not None else None),
+        "seconds_left":  decision.get("seconds_left"),
+        "composite":     decision.get("composite"),
+        "status":        status,
+        "reason":        reason,
+    }
+    attempts = []
+    if os.path.exists(ATTEMPTS_FILE):
+        try:
+            with open(ATTEMPTS_FILE) as f:
+                attempts = json.load(f)
+        except Exception:
+            pass
+    attempts.append(rec)
+    with open(ATTEMPTS_FILE, "w") as f:
+        json.dump(attempts[-20000:], f, indent=1)
+
+
+def sim_bet(decision: dict) -> bool:
+    """
+    Realistic paper bet. Mirrors PolymarketExecutor.place_order's checks,
+    in the same order, using the real public order book. Returns True on fill.
+    """
+    market_id = decision["market_id"]
+    if market_id in portfolio["positions"]:
+        return False
+    token_id = decision.get("token_id")
+    if not token_id:
+        log.warning(f"[SIM] no token_id for '{decision['question'][:40]}' — skipped")
+        return False
+
+    try:
+        asks = fetch_asks(token_id)
+    except Exception as e:
+        _log_attempt(decision, None, "error", f"book fetch failed: {e}")
+        log.warning(f"[SIM] order book fetch failed: {e}")
+        return False
+    if not asks:
+        _log_attempt(decision, None, "blocked", "empty book")
+        log.info("[SIM-BLOCK] empty order book")
+        return False
+
+    best_ask = asks[0][0]
+    decided  = decision["bet_price"]
+
+    def block(reason):
+        _log_attempt(decision, best_ask, "blocked", reason)
+        log.info(f"[SIM-BLOCK] {decision['coin']} {decision['bet_side']} | {reason}")
+        return False
+
+    if SIM_PRICE_SOURCE == "clob":
+        # Candidate fix: judge the bet at the price we can ACTUALLY get.
+        if best_ask > MAX_CROWD_PRICE:
+            return block(f"real ask {best_ask:.2f} > max crowd price {MAX_CROWD_PRICE:.2f}")
+        if (1 - best_ask) / best_ask < MIN_PAYOUT_ROI:
+            return block(f"real ask {best_ask:.2f} payout too low")
+        if decision["true_prob"] - best_ask < MIN_MARKET_EDGE:
+            return block(f"no edge at real ask {best_ask:.2f} "
+                         f"(model {decision['true_prob']:.2f})")
+    else:
+        # Live behaviour: one-sided slippage check vs the gamma decision price.
+        if best_ask - decided > SIM_SLIP_UP:
+            return block(f"slippage {(best_ask-decided)*100:.1f}c above "
+                         f"(decided {decided:.2f}, ask {best_ask:.2f})")
+        if SIM_SLIP_DOWN is not None and decided - best_ask > SIM_SLIP_DOWN:
+            return block(f"price dropped {(decided-best_ask)*100:.1f}c "
+                         f"(decided {decided:.2f}, ask {best_ask:.2f})")
+
+    if best_ask < SIM_FLOOR:
+        return block(f"ask {best_ask:.2f} below floor {SIM_FLOOR:.2f}")
+
+    avg_price, _ = walk_book(asks, decision["bet_size"])
+    if avg_price is None:
+        return block("book too thin for full fill (FOK)")
+
+    cost = fees.market_order_cost(decision["bet_size"], avg_price, "crypto")
+    _log_attempt(decision, best_ask, "filled")
+
+    portfolio["cash"] -= decision["bet_size"]
+    record = {
+        **decision,
+        "decided_price": decided,
+        "best_ask":      best_ask,
+        "fill_price":    round(avg_price, 4),
+        "net_shares":    cost["net_shares"],
+        "fee_usd":       cost["fee_usd"],
+        "opened_at":     datetime.now().isoformat(),
+    }
+    portfolio["positions"][market_id] = {**record, "resolved": False,
+                                         "_window_ts": decision.get("_window_ts", 0)}
+    portfolio["total_bets"] += 1
+
+    trades = []
+    if os.path.exists(TRADES_FILE):
+        try:
+            with open(TRADES_FILE) as f:
+                trades = json.load(f)
+        except Exception:
+            pass
+    trades.append(record)
+    with open(TRADES_FILE, "w") as f:
+        json.dump(trades, f, indent=2)
+
+    log.info(f"[SIM-FILL] {decision['bet_side']} '{decision['question'][:45]}' "
+             f"| ${decision['bet_size']:.2f} decided {decided:.2f} → filled {avg_price:.2f} "
+             f"| fee ${cost['fee_usd']:.4f}")
+    save_portfolio()
+    return True
+
+
 def resolve_positions():
     """
     Check open positions and resolve any whose window has closed.
@@ -1335,7 +1508,9 @@ def check_circuit_breaker() -> bool:
 
 def run_bot():
     global EXECUTOR
-    mode = "LIVE 💸" if LIVE_MODE else "PAPER"
+    mode = ("LIVE 💸" if LIVE_MODE else
+            f"SIM [{SIM_TAG}] price={SIM_PRICE_SOURCE} slip_up={SIM_SLIP_UP} "
+            f"slip_down={SIM_SLIP_DOWN} floor={SIM_FLOOR}" if SIM_MODE else "PAPER")
     log.info(f"Starting 5-min crypto prediction bot ({mode} mode)")
 
     # Restore portfolio state from previous session if available
@@ -1481,6 +1656,9 @@ def run_bot():
                 if LIVE_MODE:
                     if live_bet(decision):
                         bets_this_scan += 1
+                elif SIM_MODE:
+                    if sim_bet(decision):
+                        bets_this_scan += 1
                 else:
                     paper_bet(decision)
                     bets_this_scan += 1
@@ -1510,9 +1688,43 @@ if __name__ == "__main__":
                         help="REAL MONEY: route bets through PolymarketExecutor")
     parser.add_argument("--bankroll", type=float, default=20.0,
                         help="Live bankroll cap in USD (drives the executor's sizing rails)")
+    parser.add_argument("--sim", action="store_true",
+                        help="Realistic paper: fills from the REAL public order book, no money")
+    parser.add_argument("--tag", default="sim",
+                        help="Sim variant name; state files become <tag>_*.json, log <tag>_bot.log")
+    parser.add_argument("--price-source", choices=["gamma", "clob"], default="gamma",
+                        help="gamma = decide on snapshot price (live behaviour); "
+                             "clob = re-check filters at the real ask")
+    parser.add_argument("--slip-up", type=float, default=0.02,
+                        help="Block if real ask is this far above decided price")
+    parser.add_argument("--slip-down", type=float, default=None,
+                        help="Block if real ask is this far below decided price (default: no limit)")
+    parser.add_argument("--floor", type=float, default=0.0,
+                        help="Block if real ask is below this price")
     parser.add_argument("--stats", action="store_true", help="Print performance stats and exit")
     parser.add_argument("--signals", action="store_true", help="Print current signals and exit")
     args = parser.parse_args()
+
+    if args.sim and args.live:
+        print("Choose --sim OR --live, not both.")
+        sys.exit(1)
+
+    if args.sim:
+        SIM_MODE         = True
+        SIM_TAG          = args.tag
+        SIM_PRICE_SOURCE = args.price_source
+        SIM_SLIP_UP      = args.slip_up
+        SIM_SLIP_DOWN    = args.slip_down
+        SIM_FLOOR        = args.floor
+        TRADES_FILE      = f"{args.tag}_trades.json"
+        PORTFOLIO_FILE   = f"{args.tag}_portfolio.json"
+        STATS_FILE       = f"{args.tag}_stats.json"
+        ATTEMPTS_FILE    = f"{args.tag}_attempts.json"
+        _root = logging.getLogger()
+        for _h in list(_root.handlers):
+            if isinstance(_h, logging.FileHandler):
+                _root.removeHandler(_h)
+        _root.addHandler(logging.FileHandler(f"{args.tag}_bot.log"))
 
     if args.live:
         LIVE_MODE     = True
