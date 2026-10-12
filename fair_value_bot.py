@@ -157,6 +157,7 @@ class ChainlinkFeed:
         self.lock = threading.Lock()
         self.connected_since_ms = None
         self.msgs = 0
+        self.last_msg_at = time.time()
         if connect:
             threading.Thread(target=self._run, daemon=True).start()
 
@@ -171,10 +172,20 @@ class ChainlinkFeed:
             log.info("[CHAINLINK] connected and subscribed")
 
             def ping():
+                # Keepalive + watchdog: a dropped connection can hang silently,
+                # so force a reconnect if no prices arrive for 30 seconds.
+                self.last_msg_at = time.time()
                 while ws.sock and ws.sock.connected:
                     try:
                         ws.send("PING")
                     except Exception:
+                        break
+                    if time.time() - self.last_msg_at > 30:
+                        log.warning("[CHAINLINK] no prices for 30s - reconnecting")
+                        try:
+                            ws.close()
+                        except Exception:
+                            pass
                         break
                     time.sleep(5)
             threading.Thread(target=ping, daemon=True).start()
@@ -222,6 +233,7 @@ class ChainlinkFeed:
                 while dq and dq[0][0] < ts - self.KEEP_MS:
                     dq.popleft()
             self.msgs += 1
+            self.last_msg_at = time.time()
 
     def current(self, coin, max_age_s=10):
         with self.lock:
