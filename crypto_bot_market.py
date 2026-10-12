@@ -127,6 +127,15 @@ SIM_FLOOR        = 0.0
 ATTEMPTS_FILE    = "sim_attempts.json"
 CLOB_URL         = "https://clob.polymarket.com"
 
+# ── Market horizon & bet timing (configurable for experiments) ────────────────
+#   PRIMARY_INTERVAL  300 = bet on 5-min markets (5-min crowd confirms via 15-min)
+#                     900 = bet on 15-min markets (5-min crowd used as confirmation)
+#   BET_WINDOW        (min, max) seconds LEFT in the primary window during which
+#                     a bet may be placed. Default (30, 240) = original behaviour.
+PRIMARY_INTERVAL = 300
+BET_WINDOW       = (30, 240)
+CONFIRM_LABEL    = "15-min"
+
 TELEGRAM_CREDS_PATH = os.path.expanduser("~/.telegram_credentials")
 _tg = {"loaded": False, "token": None, "chat_id": None}
 
@@ -686,7 +695,7 @@ def match_and_decide(signal: dict, market_5m: dict, market_15m: Optional[dict] =
     seconds_left = market.get("_seconds_left", 300)
 
     # ── Timing gate ───────────────────────────────────────────────────────────
-    if seconds_left > 240 or seconds_left < 30:
+    if seconds_left > BET_WINDOW[1] or seconds_left < BET_WINDOW[0]:
         log.debug(f"  Timing gate: {seconds_left}s left — outside bet window")
         return None
 
@@ -738,11 +747,11 @@ def match_and_decide(signal: dict, market_5m: dict, market_15m: Optional[dict] =
         if not crowd_15m_agrees:
             if REQUIRE_3WAY_AGREE:
                 # Strict mode: skip unless 15m crowd actively agrees (NEUTRAL not enough)
-                log.info(f"  Skip: 15-min crowd ({crowd_15m_leans}) does not actively "
+                log.info(f"  Skip: {CONFIRM_LABEL} crowd ({crowd_15m_leans}) does not actively "
                          f"confirm signal ({direction}) — require 3-way agreement")
                 return None
             else:
-                log.info(f"  ⚠ 15-min crowd ({crowd_15m_leans}) does not confirm signal ({direction}) — proceeding anyway")
+                log.info(f"  ⚠ {CONFIRM_LABEL} crowd ({crowd_15m_leans}) does not confirm signal ({direction}) — proceeding anyway")
 
         log.info(f"  ✓ 3-way agreement: signal={direction} | "
                  f"5m={'UP' if market_leans_up else 'DOWN' if market_leans_down else 'NEUTRAL'} | "
@@ -817,7 +826,7 @@ def match_and_decide(signal: dict, market_5m: dict, market_15m: Optional[dict] =
     true_prob = min(true_prob, 0.85)
 
     # Adjust for time remaining
-    time_factor = 1 - (seconds_left / 300)
+    time_factor = 1 - (seconds_left / market.get("_interval", 300))
     true_prob = true_prob + (time_factor * 0.08)
     true_prob = min(true_prob, 0.88)
 
@@ -870,6 +879,7 @@ def match_and_decide(signal: dict, market_5m: dict, market_15m: Optional[dict] =
         "signals":             signal["signals"],
         "current_price":       signal["current_price"],
         "_window_ts":          market.get("_window_ts", 0),
+        "_interval":           market.get("_interval", 300),
     }
 
 
@@ -1263,7 +1273,7 @@ def resolve_positions():
 
         try:
             wts = int(str(window_ts))
-            window_close = wts + 300
+            window_close = wts + int(pos.get("_interval", 300))
         except (ValueError, TypeError):
             window_close = now_ts
 
@@ -1511,6 +1521,7 @@ def run_bot():
     mode = ("LIVE 💸" if LIVE_MODE else
             f"SIM [{SIM_TAG}] price={SIM_PRICE_SOURCE} slip_up={SIM_SLIP_UP} "
             f"slip_down={SIM_SLIP_DOWN} floor={SIM_FLOOR}" if SIM_MODE else "PAPER")
+    mode += f" | {PRIMARY_INTERVAL//60}-min markets | bet window {BET_WINDOW[0]}-{BET_WINDOW[1]}s left"
     log.info(f"Starting 5-min crypto prediction bot ({mode} mode)")
 
     # Restore portfolio state from previous session if available
@@ -1623,7 +1634,14 @@ def run_bot():
 
             # Step 3: Match signals → multi-timeframe confirmation → Claude veto → bet
             bets_this_scan = 0
-            for market in markets_5m:
+            if PRIMARY_INTERVAL == 900:
+                primary_markets = markets_15m
+                confirm_by_coin = {m["_coin"]: m for m in markets_5m}
+            else:
+                primary_markets = markets_5m
+                confirm_by_coin = markets_15m_by_coin
+
+            for market in primary_markets:
                 coin = market["_coin"]
                 if coin not in signals:
                     continue
@@ -1632,7 +1650,7 @@ def run_bot():
                     continue
 
                 signal   = signals[coin]
-                m15      = markets_15m_by_coin.get(coin)  # may be None
+                m15      = confirm_by_coin.get(coin)  # confirmation market, may be None
                 decision = match_and_decide(signal, market, m15)
 
                 if not decision:
@@ -1701,9 +1719,30 @@ if __name__ == "__main__":
                         help="Block if real ask is this far below decided price (default: no limit)")
     parser.add_argument("--floor", type=float, default=0.0,
                         help="Block if real ask is below this price")
+    parser.add_argument("--interval", type=int, choices=[5, 15], default=5,
+                        help="Market length to bet on: 5 (default) or 15 minutes")
+    parser.add_argument("--window", default=None,
+                        help="Bet only when MIN..MAX seconds are left in the window, as 'MIN,MAX' "
+                             "(default 30,240 for 5-min; 120,840 for 15-min)")
     parser.add_argument("--stats", action="store_true", help="Print performance stats and exit")
     parser.add_argument("--signals", action="store_true", help="Print current signals and exit")
     args = parser.parse_args()
+
+    if args.interval == 15:
+        PRIMARY_INTERVAL = 900
+        CONFIRM_LABEL    = "5-min"
+        BET_WINDOW       = (120, 840)
+    if args.window:
+        try:
+            lo, hi = (int(x) for x in args.window.split(","))
+            assert 0 <= lo < hi <= PRIMARY_INTERVAL
+        except Exception:
+            print(f"--window must be 'MIN,MAX' seconds left, within 0..{PRIMARY_INTERVAL}")
+            sys.exit(1)
+        BET_WINDOW = (lo, hi)
+    if args.live and (args.interval != 5 or args.window):
+        print("--interval/--window are for --sim/--paper experiments only.")
+        sys.exit(1)
 
     if args.sim and args.live:
         print("Choose --sim OR --live, not both.")
