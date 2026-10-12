@@ -33,6 +33,19 @@ from datetime import datetime, timezone, date
 from collections import deque
 from typing import Optional
 import anthropic
+
+# Windows: clicking inside a console window starts "QuickEdit" text selection,
+# which freezes the program the next time it prints. Turn that off for this window.
+if os.name == "nt":
+    try:
+        import ctypes
+        _k32 = ctypes.windll.kernel32
+        _h = _k32.GetStdHandle(-10)                 # console input handle
+        _mode = ctypes.c_uint32()
+        if _k32.GetConsoleMode(_h, ctypes.byref(_mode)):
+            _k32.SetConsoleMode(_h, (_mode.value & ~0x0040) | 0x0080)  # QuickEdit off
+    except Exception:
+        pass
 CLAUDE_MODEL = "claude-haiku-5-5"   # was claude-sonnet-4-20250514 (retired June 15, 2026)
 
 # Shared cost model — makes paper trading reflect real Polymarket fees

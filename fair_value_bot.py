@@ -46,6 +46,19 @@ import math
 import os
 import sys
 import time
+
+# Windows: clicking inside a console window starts "QuickEdit" text selection,
+# which freezes the program the next time it prints. Turn that off for this window.
+if os.name == "nt":
+    try:
+        import ctypes
+        _k32 = ctypes.windll.kernel32
+        _h = _k32.GetStdHandle(-10)                 # console input handle
+        _mode = ctypes.c_uint32()
+        if _k32.GetConsoleMode(_h, ctypes.byref(_mode)):
+            _k32.SetConsoleMode(_h, (_mode.value & ~0x0040) | 0x0080)  # QuickEdit off
+    except Exception:
+        pass
 from datetime import datetime
 
 # Windows consoles default to a legacy encoding; keep logging from erroring.
