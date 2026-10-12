@@ -33,6 +33,7 @@ CAVEATS
 USAGE
     python fair_value_bot.py --tag sim_fv                 # 5-min markets
     python fair_value_bot.py --tag sim_fv15 --interval 15 # 15-min markets
+    python fair_value_bot.py --tag sim_cl --price-feed chainlink   # Chainlink prices
     python sim_report.py sim_fv                           # results
 Files: <tag>_portfolio.json, <tag>_trades.json, <tag>_attempts.json,
        <tag>_model.jsonl (every model-vs-market snapshot, for calibration),
@@ -74,6 +75,7 @@ import polymarket_fees as fees
 log = logging.getLogger("fair_value")
 
 BET_USD = 1.0
+PRICE_FEED = "kraken"
 
 
 # ── Model ─────────────────────────────────────────────────────────────────────
@@ -135,6 +137,111 @@ class PriceData:
         return one_minute_vol(closes)
 
 
+
+class ChainlinkFeed:
+    """
+    Live Chainlink prices from Polymarket's own real-time data socket - the same
+    feed these markets settle on. Keeps ~2 hours of ticks per coin so we can look
+    up the exact price at each window's start.
+    No history is sent on connect, so a window that started before we connected
+    is skipped (we can't know its start price).
+    """
+    URL = "wss://ws-live-data.polymarket.com"
+    KEEP_MS = 2 * 3600 * 1000
+
+    def __init__(self, coins, connect=True):
+        import threading
+        from collections import deque
+        self.ticks = {c: deque() for c in coins}          # coin -> (ts_ms, price)
+        self.sym_to_coin = {f"{c.lower()}/usd": c for c in coins}
+        self.lock = threading.Lock()
+        self.connected_since_ms = None
+        self.msgs = 0
+        if connect:
+            threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        import websocket, threading
+        sub = json.dumps({"action": "subscribe", "subscriptions": [
+            {"topic": "crypto_prices_chainlink", "type": "*", "filters": ""}]})
+
+        def on_open(ws):
+            ws.send(sub)
+            self.connected_since_ms = int(time.time() * 1000)
+            log.info("[CHAINLINK] connected and subscribed")
+
+            def ping():
+                while ws.sock and ws.sock.connected:
+                    try:
+                        ws.send("PING")
+                    except Exception:
+                        break
+                    time.sleep(5)
+            threading.Thread(target=ping, daemon=True).start()
+
+        def on_message(ws, raw):
+            self._ingest(raw)
+
+        def on_close(ws, *a):
+            self.connected_since_ms = None
+            log.warning("[CHAINLINK] disconnected - reconnecting")
+
+        while True:
+            try:
+                websocket.WebSocketApp(self.URL, on_open=on_open, on_message=on_message,
+                                       on_close=on_close,
+                                       on_error=lambda ws, e: log.warning(f"[CHAINLINK] {e}")
+                                       ).run_forever()
+            except Exception as e:
+                log.warning(f"[CHAINLINK] socket error: {e}")
+            self.connected_since_ms = None
+            time.sleep(3)
+
+    def _ingest(self, raw):
+        try:
+            m = json.loads(raw)
+        except Exception:
+            return                                        # PONG etc.
+        if not isinstance(m, dict) or m.get("topic") != "crypto_prices_chainlink":
+            return
+        p = m.get("payload") or {}
+        sym = p.get("symbol", "")
+        # Normally one price per message; accept a batch ("data": [...]) too.
+        points = p.get("data") if isinstance(p.get("data"), list) else [p]
+        coin = self.sym_to_coin.get(str(sym).lower())
+        for pt in points:
+            c = self.sym_to_coin.get(str(pt.get("symbol", sym)).lower()) or coin
+            if not c or pt.get("value") is None:
+                continue
+            ts = int(pt.get("timestamp") or m.get("timestamp"))
+            val = float(pt["value"])
+            with self.lock:
+                dq = self.ticks[c]
+                if not dq or ts >= dq[-1][0]:
+                    dq.append((ts, val))
+                while dq and dq[0][0] < ts - self.KEEP_MS:
+                    dq.popleft()
+            self.msgs += 1
+
+    def current(self, coin, max_age_s=10):
+        with self.lock:
+            dq = self.ticks.get(coin)
+            if not dq:
+                return None
+            ts, val = dq[-1]
+        return val if time.time() * 1000 - ts <= max_age_s * 1000 else None
+
+    def start_price(self, coin, window_ts):
+        """Last Chainlink price at or before the window start (needs a tick within 5s of it)."""
+        start_ms = window_ts * 1000
+        with self.lock:
+            dq = list(self.ticks.get(coin, ()))
+        before = [t for t in dq if t[0] <= start_ms]
+        after = [t for t in dq if t[0] > start_ms]
+        if not before or not after or start_ms - before[-1][0] > 5000:
+            return None
+        return before[-1][1]
+
 def current_prices(symbols: list) -> dict:
     t = cb.exchange.fetch_tickers(symbols)
     return {s: t[s]["last"] for s in symbols if s in t and t[s].get("last")}
@@ -182,6 +289,7 @@ def record_fill(market: dict, side: str, token_id: str, ask: float, avg: float,
         "seconds_left":  secs_left,
         "start_price":   start,
         "price_at_bet":  now,
+        "price_feed":    PRICE_FEED,
         "opened_at":     datetime.now().isoformat(),
         "_window_ts":    market["_window_ts"],
         "_interval":     market["_interval"],
@@ -207,7 +315,7 @@ def record_fill(market: dict, side: str, token_id: str, ask: float, avg: float,
 
 # ── One evaluation per market ─────────────────────────────────────────────────
 
-def evaluate(market: dict, args, prices: dict, pdata: PriceData, model_log: str):
+def evaluate(market: dict, args, prices: dict, pdata: PriceData, model_log: str, feed=None):
     coin = market["_coin"]
     symbol = cb.COINS[coin]
     window_ts = market["_window_ts"]
@@ -219,9 +327,13 @@ def evaluate(market: dict, args, prices: dict, pdata: PriceData, model_log: str)
     if market.get("id", "") in cb.portfolio["positions"]:
         return
 
-    now = prices.get(symbol)
-    start = pdata.start_price(symbol, window_ts)
-    sd = pdata.vol(symbol, window_ts)
+    if feed is not None:
+        now = feed.current(coin)
+        start = feed.start_price(coin, window_ts)
+    else:
+        now = prices.get(symbol)
+        start = pdata.start_price(symbol, window_ts)
+    sd = pdata.vol(symbol, window_ts)            # volatility level from Kraken candles
     if not now or not start or sd <= 0:
         return
 
@@ -249,7 +361,7 @@ def evaluate(market: dict, args, prices: dict, pdata: PriceData, model_log: str)
         "ts": int(time.time()), "coin": coin, "window_ts": window_ts,
         "interval": interval, "secs_left": secs_left, "start": start, "now": now,
         "sd_1m": round(sd, 6), "p_up": round(p, 4),
-        "ask_yes": ask_yes, "ask_no": ask_no,
+        "ask_yes": ask_yes, "ask_no": ask_no, "feed": "chainlink" if feed else "kraken",
     })
 
     side, ask, book, tok, edge = (("YES", ask_yes, yes_asks, yes_tok, edge_yes)
@@ -302,6 +414,9 @@ def main():
     ap.add_argument("--max-divergence", type=float, default=0.30,
                     help="Skip if model and market disagree by more than this")
     ap.add_argument("--scan", type=float, default=5.0, help="Seconds between scans")
+    ap.add_argument("--price-feed", choices=["kraken", "chainlink"], default="kraken",
+                    help="Where start and current prices come from. 'chainlink' uses "
+                         "Polymarket's live Chainlink feed, the one these markets settle on")
     args = ap.parse_args()
 
     interval = 900 if args.interval == 15 else 300
@@ -329,8 +444,12 @@ def main():
     root.addHandler(fh)
 
     log.info(f"Fair-value SIM [{args.tag}] | {interval//60}-min markets | edge >= {args.edge} "
-             f"| window {lo}-{hi}s left | max divergence {args.max_divergence} | NO real orders")
+             f"| window {lo}-{hi}s left | max divergence {args.max_divergence} "
+             f"| prices: {args.price_feed} | NO real orders")
     cb.load_portfolio()
+    global PRICE_FEED
+    PRICE_FEED = args.price_feed
+    feed = ChainlinkFeed(list(cb.COINS)) if args.price_feed == "chainlink" else None
     pdata = PriceData()
     symbols = [cb.COINS[c] for c in cb.COINS]
     scans = 0
@@ -345,11 +464,14 @@ def main():
                 for coin in cb.COINS:
                     m = cb.fetch_market_by_slug(coin, slugs, interval)
                     if m:
-                        evaluate(m, args, prices, pdata, model_log)
+                        evaluate(m, args, prices, pdata, model_log, feed)
             if scans % 60 == 0:
                 res = cb.portfolio.get("resolved", [])
                 w = sum(1 for r in res if r.get("outcome") == "WIN")
                 pnl = sum(r.get("profit", 0) for r in res)
+                if feed is not None:
+                    log.info(f"[CHAINLINK] {feed.msgs} price updates so far | "
+                             + " ".join(f"{c}={feed.current(c)}" for c in cb.COINS))
                 log.info(f"[FV-STATUS] scans={scans} bets={cb.portfolio['total_bets']} "
                          f"resolved={len(res)} wins={w} P&L={pnl:+.2f} "
                          f"open={len(cb.portfolio['positions'])}")
