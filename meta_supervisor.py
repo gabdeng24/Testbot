@@ -36,6 +36,7 @@ import subprocess
 from datetime import datetime, timedelta
 from typing import Optional
 import anthropic
+CLAUDE_MODEL = "claude-haiku-5-5"   # was claude-sonnet-4-20250514 (retired June 15, 2026)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -232,7 +233,7 @@ def run_fix_agent(errors: list, code: str,
 
     try:
         resp = claude.messages.create(
-            model      = "claude-sonnet-4-20250514",
+            model      = CLAUDE_MODEL,
             max_tokens = 1500,
             system     = (
                 "You are a Python code repair agent. "
@@ -242,7 +243,7 @@ def run_fix_agent(errors: list, code: str,
             ),
             messages   = [{"role": "user", "content": prompt}],
         )
-        raw = resp.content[0].text.strip()
+        raw = next(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
         raw = raw.replace("```json", "").replace("```", "").strip()
         if not raw:
             log.error("Fix agent returned empty response")

@@ -45,6 +45,7 @@ import requests
 from datetime import datetime, timezone, date
 from typing import Optional
 import anthropic
+CLAUDE_MODEL = "claude-haiku-5-5"   # was claude-sonnet-4-20250514 (retired June 15, 2026)
 
 # ── Try importing blockchain libs (only needed for live trading) ──────────────
 try:
@@ -382,12 +383,12 @@ def analyze_market(market: dict, claude_client: anthropic.Anthropic) -> Optional
 
     try:
         response = claude_client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=CLAUDE_MODEL,
             max_tokens=600,
             messages=[{"role": "user", "content": prompt}],
         )
 
-        raw = response.content[0].text.strip()
+        raw = next(b.text for b in response.content if getattr(b, "type", "") == "text").strip()
         # Strip markdown fences if present
         raw = raw.replace("```json", "").replace("```", "").strip()
         analysis = json.loads(raw)

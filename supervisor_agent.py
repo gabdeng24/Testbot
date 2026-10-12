@@ -47,6 +47,7 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import Optional
 import anthropic
+CLAUDE_MODEL = "claude-haiku-5-5"   # was claude-sonnet-4-20250514 (retired June 15, 2026)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -819,12 +820,12 @@ def run_free_think_agent(context: str, signals: str,
 
     try:
         resp = claude.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=CLAUDE_MODEL,
             max_tokens=2000,
             system="You are a trading bot engineer. You MUST respond with valid JSON only. No prose, no markdown, no explanation outside the JSON object. Your entire response must be parseable by json.loads().",
             messages=[{"role": "user", "content": prompt}],
         )
-        raw = resp.content[0].text.strip()
+        raw = next(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
         log.info(f"Raw response ({len(raw)} chars): {raw[:200]}")
         raw = raw.replace("```json","").replace("```","").strip()
 
@@ -1119,12 +1120,12 @@ def run_patch_with_self_correction(diagnosis: dict, bot_file: str,
 
         try:
             resp = claude.messages.create(
-                model      = "claude-sonnet-4-20250514",
+                model      = CLAUDE_MODEL,
                 max_tokens = 1500,
                 system     = "You are a Python code patching agent. Respond with valid JSON only. No prose, no markdown, no explanation outside the JSON object. Your entire response must start with { and end with } and be parseable by json.loads().",
                 messages   = [{"role": "user", "content": correction_prompt}],
             )
-            raw = resp.content[0].text.strip()
+            raw = next(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
             raw = raw.replace("```json","").replace("```","").strip()
             corrected = json.loads(raw)
             log.info(f"Self-corrected patch: {corrected.get('summary','')}")
@@ -1229,12 +1230,12 @@ def run_patch_agent(diagnosis: dict, bot_file: str,
     )
     try:
         resp = claude.messages.create(
-            model      = "claude-sonnet-4-20250514",
+            model      = CLAUDE_MODEL,
             max_tokens = 2000,
             system     = "You are a Python code patching agent. Respond with valid JSON only. No prose, no markdown, no explanation outside the JSON object. Your entire response must start with { and end with } and be parseable by json.loads().",
             messages   = [{"role": "user", "content": prompt}],
         )
-        raw = resp.content[0].text.strip()
+        raw = next(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
         raw = raw.replace("```json","").replace("```","").strip()
         if not raw:
             log.error("Patch agent returned empty response")
@@ -1918,7 +1919,7 @@ def review_patch(thinking: dict, patch: dict,
 
     try:
         resp = claude.messages.create(
-            model      = "claude-sonnet-4-20250514",
+            model      = CLAUDE_MODEL,
             max_tokens = 600,
             system     = (
                 "You are a SKEPTICAL senior engineer reviewing patches. "
@@ -1927,7 +1928,7 @@ def review_patch(thinking: dict, patch: dict,
             ),
             messages   = [{"role": "user", "content": prompt}],
         )
-        raw = resp.content[0].text.strip()
+        raw = next(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
         raw = raw.replace("```json","").replace("```","").strip()
         result = json.loads(raw)
 

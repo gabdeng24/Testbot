@@ -33,6 +33,7 @@ from datetime import datetime, timezone, date
 from collections import deque
 from typing import Optional
 import anthropic
+CLAUDE_MODEL = "claude-haiku-5-5"   # was claude-sonnet-4-20250514 (retired June 15, 2026)
 
 # Shared cost model — makes paper trading reflect real Polymarket fees
 import polymarket_fees as fees
@@ -973,11 +974,12 @@ def claude_veto(decision: dict, claude_client: anthropic.Anthropic) -> tuple[boo
 
     try:
         response = claude_client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=150,
+            model=CLAUDE_MODEL,
+            max_tokens=1024,
             messages=[{"role": "user", "content": prompt}],
+            extra_body={"output_config": {"effort": "low"}},   # quick yes/no; keep thinking short
         )
-        raw = response.content[0].text.strip()
+        raw = next(b.text for b in response.content if getattr(b, "type", "") == "text").strip()
         raw = raw.replace("```json", "").replace("```", "").strip()
         result = json.loads(raw)
         return result.get("approve", True), result.get("reason", "")
