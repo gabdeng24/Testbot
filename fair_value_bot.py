@@ -270,8 +270,7 @@ def log_attempt(rec: dict):
         except Exception:
             pass
     attempts.append(rec)
-    with open(cb.ATTEMPTS_FILE, "w") as f:
-        json.dump(attempts[-20000:], f, indent=1)
+    cb.write_json_atomic(cb.ATTEMPTS_FILE, attempts[-20000:], indent=1)
 
 
 def log_model(path: str, rec: dict):
@@ -318,8 +317,7 @@ def record_fill(market: dict, side: str, token_id: str, ask: float, avg: float,
         except Exception:
             pass
     trades.append(rec)
-    with open(cb.TRADES_FILE, "w") as f:
-        json.dump(trades, f, indent=2)
+    cb.write_json_atomic(cb.TRADES_FILE, trades, indent=2)
     cb.save_portfolio()
     log.info(f"[FV-FILL] {market['_coin']} {side} @ {avg:.3f} | model {p_side:.3f} "
              f"| edge {edge:+.3f} | {secs_left}s left | {market.get('question','')[:50]}")
@@ -472,7 +470,8 @@ def main():
             cb.resolve_positions()
             secs_left = cb.get_seconds_until_close(interval)
             if lo <= secs_left <= hi:
-                prices = current_prices(symbols)
+                # Chainlink mode gets live prices from the feed; skip the Kraken call
+                prices = {} if feed is not None else current_prices(symbols)
                 for coin in cb.COINS:
                     m = cb.fetch_market_by_slug(coin, slugs, interval)
                     if m:

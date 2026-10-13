@@ -198,6 +198,23 @@ def _maybe_daily_summary():
         log.debug(f"daily summary failed: {e}")
 
 
+
+def write_json_atomic(path, obj, **kw):
+    """Write to a temp file, then swap it in, so a crash or a closed window
+    can never leave a half-written (corrupt) JSON file behind."""
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, **kw)
+        f.flush()
+        os.fsync(f.fileno())
+    for attempt in range(10):          # Windows: another program may briefly hold the file
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(0.2)
+    os.replace(tmp, path)
+
 def save_portfolio():
     """Save portfolio state to disk so it survives restarts."""
     try:
@@ -212,8 +229,7 @@ def save_portfolio():
             "resolved":            portfolio["resolved"][-200:],
             "saved_at":            datetime.now().isoformat(),
         }
-        with open(PORTFOLIO_FILE, "w") as f:
-            json.dump(state, f, indent=2)
+        write_json_atomic(PORTFOLIO_FILE, state, indent=2)
     except Exception as e:
         log.warning(f"Could not save portfolio state: {e}")
 
@@ -1047,8 +1063,7 @@ def paper_bet(decision: dict):
         "fee_usd":    cost["fee_usd"],
         "opened_at":  datetime.now().isoformat(),
     })
-    with open(TRADES_FILE, "w") as f:
-        json.dump(trades, f, indent=2)
+    write_json_atomic(TRADES_FILE, trades, indent=2)
 
     log.info(
         f"[MARKET] {decision['bet_side']} on '{decision['question'][:50]}' "
@@ -1110,8 +1125,7 @@ def live_bet(decision: dict):
         "tx_hash":    res.get("tx_hash"),
         "opened_at":  datetime.now().isoformat(),
     })
-    with open(TRADES_FILE, "w") as f:
-        json.dump(trades, f, indent=2)
+    write_json_atomic(TRADES_FILE, trades, indent=2)
 
     log.info(
         f"[LIVE] {decision['bet_side']} on '{decision['question'][:50]}' "
@@ -1176,8 +1190,7 @@ def _log_attempt(decision: dict, best_ask, status: str, reason: str = ""):
         except Exception:
             pass
     attempts.append(rec)
-    with open(ATTEMPTS_FILE, "w") as f:
-        json.dump(attempts[-20000:], f, indent=1)
+    write_json_atomic(ATTEMPTS_FILE, attempts[-20000:], indent=1)
 
 
 def sim_bet(decision: dict) -> bool:
@@ -1262,8 +1275,7 @@ def sim_bet(decision: dict) -> bool:
         except Exception:
             pass
     trades.append(record)
-    with open(TRADES_FILE, "w") as f:
-        json.dump(trades, f, indent=2)
+    write_json_atomic(TRADES_FILE, trades, indent=2)
 
     log.info(f"[SIM-FILL] {decision['bet_side']} '{decision['question'][:45]}' "
              f"| ${decision['bet_size']:.2f} decided {decided:.2f} → filled {avg_price:.2f} "
@@ -1372,8 +1384,7 @@ def resolve_positions():
                         t["profit"]  = resolved_trade["profit"]
                         t["resolved_at"] = resolved_trade["resolved_at"]
                         break
-                with open(TRADES_FILE, "w") as f:
-                    json.dump(all_trades, f, indent=2)
+                write_json_atomic(TRADES_FILE, all_trades, indent=2)
             except Exception as e:
                 log.debug(f"Could not update trades file with outcome: {e}")
 
