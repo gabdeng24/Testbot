@@ -64,14 +64,44 @@ def get(url, params=None, tries=4):
     return None
 
 
+LOOKUP_USED = {}
+
+
+def _first(data):
+    return data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) and data else None)
+
+
 def market_info(coin, wts):
-    r = get(f"{GAMMA}/markets", {"slug": f"{SLUGS[coin]}-{wts}"})
-    if r is None or r.status_code != 200:
-        return None, f"gamma http {getattr(r, 'status_code', 'none')}"
-    data = r.json()
-    m = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) and data else None)
+    """Finished markets can be hidden from the default search, so try several lookups."""
+    slug = f"{SLUGS[coin]}-{wts}"
+    attempts = [
+        ("markets?slug", f"{GAMMA}/markets", {"slug": slug}),
+        ("markets?slug&closed", f"{GAMMA}/markets", {"slug": slug, "closed": "true"}),
+        ("markets/slug/", f"{GAMMA}/markets/slug/{slug}", None),
+        ("events?slug", f"{GAMMA}/events", {"slug": slug}),
+        ("events?slug&closed", f"{GAMMA}/events", {"slug": slug, "closed": "true"}),
+    ]
+    m, last = None, "no such market"
+    for name, url, params in attempts:
+        r = get(url, params)
+        if r is None or r.status_code != 200:
+            last = f"gamma {name} http {getattr(r, 'status_code', 'none')}"
+            continue
+        try:
+            x = _first(r.json())
+        except Exception:
+            continue
+        if x and name.startswith("events"):
+            ev = x
+            x = _first(ev.get("markets") or [])
+            if x is not None:
+                x.setdefault("events", [ev])
+        if x:
+            m = x
+            LOOKUP_USED[name] = LOOKUP_USED.get(name, 0) + 1
+            break
     if not m:
-        return None, "no such market"
+        return None, last
     keep = {k: m.get(k) for k in ("id", "question", "closed", "outcomePrices", "clobTokenIds",
                                   "outcomes", "startDate", "endDate", "volume", "eventStartTime")}
     # Polymarket sometimes exposes the official start price ("price to beat") in event metadata
@@ -156,16 +186,19 @@ def main():
     windows = (t1 - t0) // 300
 
     if a.probe:
-        todo = [(c, t0 + 300 * rng.randrange(windows), "probe") for c in ("BTC", "ETH", "SOL", "XRP")]
+        val = validation_markets()
+        todo = [(c, w, "probe-known") for c, w in val[-2:]]          # markets the bots traded
+        todo += [(c, t0 + 300 * rng.randrange(windows), "probe") for c in ("BTC", "SOL")]
         for coin, wts, src in todo:
             r = collect(coin, wts, src)
             h = r.get("hist_up") or []
             c = r.get("candles") or []
-            log(f"PROBE {coin} {datetime.fromtimestamp(wts, timezone.utc):%Y-%m-%d %H:%M} UTC | "
+            log(f"PROBE[{src}] {coin} {datetime.fromtimestamp(wts, timezone.utc):%Y-%m-%d %H:%M} UTC | "
                 f"market: {'ok' if r.get('market') else r.get('error')} | "
                 f"result: {(r.get('market') or {}).get('outcomePrices')} | "
                 f"price points: {len(h)} {h[:3]} | candles: {len(c)} from {r.get('candle_src')} | "
                 f"price-to-beat field: {(r.get('market') or {}).get('eventMetadata')}")
+        log(f"PROBE lookups that worked: {LOOKUP_USED or 'none'}")
         return
 
     done = set()
@@ -173,7 +206,8 @@ def main():
         for line in open(OUT, encoding="utf-8"):
             try:
                 x = json.loads(line)
-                done.add((x["coin"], x["wts"]))
+                if not x.get("error"):           # failed lookups are retried
+                    done.add((x["coin"], x["wts"]))
             except Exception:
                 pass
 
@@ -203,7 +237,7 @@ def main():
             sys.exit(2)
         if i % 50 == 0 or i == len(todo):
             rate = i / max(1, time.time() - started)
-            log(f"{i}/{len(todo)} done | complete {ok} | missing data {errs} | "
+            log(f"{i}/{len(todo)} done | complete {ok} | missing data {errs} | lookups {LOOKUP_USED} | "
                 f"~{(len(todo) - i) / max(rate, 0.01) / 60:.0f} min left")
         time.sleep(0.15)
     log("FINISHED")
