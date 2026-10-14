@@ -26,3 +26,9 @@ backtest_stderr.txt
 backtest_report.txt
 backtest_results.json
 bt_snapshot/
+backtest_trades.jsonl
+backtest_trades.log
+backtest_trades_stdout.txt
+backtest_trades_stderr.txt
+backtest_trades_report.txt
+backtest_trades_results.json
