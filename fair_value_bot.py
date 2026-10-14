@@ -323,6 +323,31 @@ def record_fill(market: dict, side: str, token_id: str, ask: float, avg: float,
              f"| edge {edge:+.3f} | {secs_left}s left | {market.get('question','')[:50]}")
 
 
+def limit_for(book: list, usd: float):
+    """Highest price level needed to fill `usd` - the limit price a real
+    fill-or-kill order would carry. None if the book is too thin."""
+    remaining = usd
+    for price, size in book:
+        remaining -= price * size
+        if remaining <= 1e-9:
+            return price
+    return None
+
+
+def delayed_fill(tok: str, limit: float, delay: float):
+    """Model order latency: wait, re-read the book, and fill only from asks
+    still at or below our limit. Returns (avg_price, ask_now) or (None, ask_now)."""
+    time.sleep(delay)
+    try:
+        asks = cb.fetch_asks(str(tok))
+    except Exception:
+        return None, None
+    ask_now = asks[0][0] if asks else None
+    usable = [(p, sz) for p, sz in asks if p <= limit + 1e-9]
+    avg, _ = cb.walk_book(usable, BET_USD)
+    return avg, ask_now
+
+
 # ── One evaluation per market ─────────────────────────────────────────────────
 
 def evaluate(market: dict, args, prices: dict, pdata: PriceData, model_log: str, feed=None):
@@ -406,6 +431,19 @@ def evaluate(market: dict, args, prices: dict, pdata: PriceData, model_log: str,
                      "reason": f"edge gone after walking book (avg {avg:.3f})"})
         return
 
+    delay = getattr(args, "fill_delay", 0) or 0
+    if delay > 0:
+        limit = limit_for(book, BET_USD)
+        d_avg, ask_now = delayed_fill(tok, limit, delay)
+        if d_avg is None:
+            log_attempt({**base, "status": "missed", "would_fill_at": round(avg, 4),
+                         "ask_after_delay": ask_now, "reason":
+                         f"price moved during {delay}s delay (limit {limit:.2f}, ask now {ask_now})"})
+            log.info(f"[FV-MISS] {coin} {side}: limit {limit:.2f}, ask after {delay}s = {ask_now}")
+            return
+        avg = d_avg
+        real_edge = p_side - avg - fee_per_share(avg)
+
     log_attempt({**base, "status": "filled"})
     record_fill(market, side, str(tok), ask, avg, p, real_edge, secs_left, start, now)
 
@@ -424,6 +462,10 @@ def main():
     ap.add_argument("--max-divergence", type=float, default=0.30,
                     help="Skip if model and market disagree by more than this")
     ap.add_argument("--scan", type=float, default=5.0, help="Seconds between scans")
+    ap.add_argument("--fill-delay", type=float, default=0.0,
+                    help="Seconds between deciding and the order 'arriving'. After the delay the "
+                         "book is re-read and the bet fills only if the price is still there "
+                         "(models a real limit order). Default 0 = instant fill")
     ap.add_argument("--price-feed", choices=["kraken", "chainlink"], default="kraken",
                     help="Where start and current prices come from. 'chainlink' uses "
                          "Polymarket's live Chainlink feed, the one these markets settle on")
@@ -455,7 +497,7 @@ def main():
 
     log.info(f"Fair-value SIM [{args.tag}] | {interval//60}-min markets | edge >= {args.edge} "
              f"| window {lo}-{hi}s left | max divergence {args.max_divergence} "
-             f"| prices: {args.price_feed} | NO real orders")
+             f"| prices: {args.price_feed} | fill delay {args.fill_delay}s | NO real orders")
     cb.load_portfolio()
     global PRICE_FEED
     PRICE_FEED = args.price_feed
