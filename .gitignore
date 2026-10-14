@@ -19,3 +19,10 @@ patch_history.json
 *.log
 # Supervisor backups
 *.backup_*
+backtest_data.jsonl
+backtest_collect.log
+backtest_stdout.txt
+backtest_stderr.txt
+backtest_report.txt
+backtest_results.json
+bt_snapshot/
