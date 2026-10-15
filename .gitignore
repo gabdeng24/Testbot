@@ -32,3 +32,9 @@ backtest_trades_stdout.txt
 backtest_trades_stderr.txt
 backtest_trades_report.txt
 backtest_trades_results.json
+backtest_hourly.jsonl
+backtest_hourly.log
+backtest_hourly_stdout.txt
+backtest_hourly_stderr.txt
+backtest_hourly_report.txt
+backtest_hourly_results.json
